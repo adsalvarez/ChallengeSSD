@@ -1,0 +1,268 @@
+---
+- name: Redis Day 2 Operations
+  hosts: redis
+  become: true
+  gather_facts: true
+
+  vars:
+    redis_service_name: redis
+    redis_cli_path: /usr/bin/redis-cli
+    redis_data_dir: /var/lib/redis
+    redis_rdb_file: dump.rdb
+    redis_backup_dir: /var/backups/redis
+    redis_port: 6379
+
+    # Operation to execute:
+    # status | start | stop | restart | backup | restore | create_user
+    operation: status
+
+    # Restore source file
+    restore_source_file: "{{ redis_backup_dir }}/dump.rdb"
+
+    # ACL user variables
+    redis_acl_user: app_user
+    redis_acl_permissions: "on ~* +@all"
+
+  vars_prompt:
+    # Credentials collected at runtime — never stored in plaintext.
+    # For unattended runs, replace vars_prompt with ansible-vault encrypted vars:
+    #   ansible-vault encrypt_string 'MySecret' --name 'redis_password'
+    #   ansible-vault encrypt_string 'MySecret' --name 'redis_acl_password'
+    - name: redis_password
+      prompt: "Redis AUTH password (leave empty if auth is disabled)"
+      private: true
+      default: ""
+
+    - name: redis_acl_password
+      prompt: "New ACL user password (required for create_user)"
+      private: true
+      default: ""
+
+  tasks:
+    - name: Validate selected operation
+      ansible.builtin.assert:
+        that:
+          - operation in ['status', 'start', 'stop', 'restart', 'backup', 'restore', 'create_user']
+        fail_msg: "Invalid operation. Use one of: status, start, stop, restart, backup, restore, create_user"
+      tags: [always]
+
+    - name: Ensure backup directory exists
+      ansible.builtin.file:
+        path: "{{ redis_backup_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      when: operation in ['backup', 'restore']
+      tags: [backup, restore]
+
+    # no_log prevents password from appearing in Ansible output / AWX logs.
+    # Guard added — auth arg is only built when the CLI will actually be called.
+    - name: Build redis auth argument
+      ansible.builtin.set_fact:
+        redis_auth_arg: "{{ '--pass ' + redis_password if redis_password | length > 0 else '' }}"
+      no_log: true
+      when: operation in ['backup', 'create_user']
+      tags: [backup, create_user]
+
+    # -------------------------------------------------------------------------
+    # STATUS
+    # -------------------------------------------------------------------------
+    # changed_when: false — systemd query never causes a real change.
+    - name: Check Redis service status
+      ansible.builtin.systemd:
+        name: "{{ redis_service_name }}"
+      register: redis_service_status
+      changed_when: false
+      when: operation == 'status'
+      tags: [status]
+
+    - name: Show Redis service status
+      ansible.builtin.debug:
+        msg:
+          - "Service: {{ redis_service_name }}"
+          - "State: {{ redis_service_status.status.ActiveState | default('unknown') }}"
+          - "SubState: {{ redis_service_status.status.SubState | default('unknown') }}"
+      when: operation == 'status'
+      tags: [status]
+
+    # -------------------------------------------------------------------------
+    # START / STOP / RESTART
+    # -------------------------------------------------------------------------
+    - name: Start Redis service
+      ansible.builtin.systemd:
+        name: "{{ redis_service_name }}"
+        state: started
+        enabled: true
+      when: operation == 'start'
+      tags: [start]
+
+    - name: Stop Redis service
+      ansible.builtin.systemd:
+        name: "{{ redis_service_name }}"
+        state: stopped
+      when: operation == 'stop'
+      tags: [stop]
+
+    - name: Restart Redis service
+      ansible.builtin.systemd:
+        name: "{{ redis_service_name }}"
+        state: restarted
+      when: operation == 'restart'
+      tags: [restart]
+
+    # -------------------------------------------------------------------------
+    # BACKUP
+    #               Capture LASTSAVE timestamp before BGSAVE, then poll
+    #               INFO persistence until rdb_bgsave_in_progress == 0 and
+    #               LASTSAVE has advanced. This avoids copying a stale RDB that
+    #               happens to exist from a previous save cycle.
+    # -------------------------------------------------------------------------
+    - name: Capture LASTSAVE timestamp before backup
+      ansible.builtin.command:
+        cmd: "{{ redis_cli_path }} -p {{ redis_port }} {{ redis_auth_arg }} LASTSAVE"
+      register: redis_lastsave_before
+      changed_when: false
+      no_log: true
+      when: operation == 'backup'
+      tags: [backup]
+
+    - name: Trigger Redis background save
+      ansible.builtin.command:
+        cmd: "{{ redis_cli_path }} -p {{ redis_port }} {{ redis_auth_arg }} BGSAVE"
+      register: redis_bgsave
+      changed_when: "'Background saving started' in redis_bgsave.stdout"
+      no_log: true
+      when: operation == 'backup'
+      tags: [backup]
+
+    - name: Wait for BGSAVE to complete (poll INFO persistence)
+      ansible.builtin.command:
+        cmd: "{{ redis_cli_path }} -p {{ redis_port }} {{ redis_auth_arg }} INFO persistence"
+      register: redis_persistence_info
+      retries: 20
+      delay: 3
+      until: >
+        ('rdb_bgsave_in_progress:0' in redis_persistence_info.stdout) and
+        (redis_persistence_info.stdout | regex_search('rdb_last_save_time:(\d+)', '\1') | first | int
+         > redis_lastsave_before.stdout | trim | int)
+      changed_when: false
+      no_log: true
+      when: operation == 'backup'
+      tags: [backup]
+
+    - name: Backup Redis RDB file with timestamp
+      ansible.builtin.copy:
+        src: "{{ redis_data_dir }}/{{ redis_rdb_file }}"
+        dest: "{{ redis_backup_dir }}/dump-{{ ansible_date_time.iso8601_basic_short }}.rdb"
+        remote_src: true
+        owner: redis
+        group: redis
+        mode: "0640"
+      when: operation == 'backup'
+      tags: [backup]
+
+    - name: Show backup completion message
+      ansible.builtin.debug:
+        msg: "Redis backup created at {{ redis_backup_dir }}/dump-{{ ansible_date_time.iso8601_basic_short }}.rdb"
+      when: operation == 'backup'
+      tags: [backup]
+
+    # -------------------------------------------------------------------------
+    # RESTORE
+    #               block/rescue/always — if the copy fails, Redis is restarted
+    #               in the rescue block so the service does not stay down.
+    # -------------------------------------------------------------------------
+    - name: Validate restore source file exists
+      ansible.builtin.stat:
+        path: "{{ restore_source_file }}"
+      register: restore_file_stat
+      when: operation == 'restore'
+      tags: [restore]
+
+    - name: Fail if restore source file does not exist
+      ansible.builtin.fail:
+        msg: "Restore source file not found: {{ restore_source_file }}"
+      when:
+        - operation == 'restore'
+        - not restore_file_stat.stat.exists
+      tags: [restore]
+
+    - name: Restore RDB — stop, replace, start (with recovery on failure)
+      when: operation == 'restore'
+      tags: [restore]
+      block:
+        - name: Stop Redis before restore
+          ansible.builtin.systemd:
+            name: "{{ redis_service_name }}"
+            state: stopped
+
+        - name: Restore RDB file
+          ansible.builtin.copy:
+            src: "{{ restore_source_file }}"
+            dest: "{{ redis_data_dir }}/{{ redis_rdb_file }}"
+            remote_src: true
+            owner: redis
+            group: redis
+            mode: "0660"
+
+        - name: Start Redis after successful restore
+          ansible.builtin.systemd:
+            name: "{{ redis_service_name }}"
+            state: started
+            enabled: true
+
+        - name: Show restore completion message
+          ansible.builtin.debug:
+            msg: "Redis restore completed from {{ restore_source_file }}"
+
+      rescue:
+        - name: Restart Redis after failed restore (recovery)
+          ansible.builtin.systemd:
+            name: "{{ redis_service_name }}"
+            state: started
+            enabled: true
+
+        - name: Fail with clear error after recovery restart
+          ansible.builtin.fail:
+            msg: >
+              Restore failed — Redis has been restarted with its previous data.
+              Check the error above and verify that {{ restore_source_file }} is a valid RDB file.
+
+    # -------------------------------------------------------------------------
+    # CREATE USER
+    #                 no_log on both the set_fact and the ACL command.
+    #                 ACL SAVE added to persist the new user across restarts.
+    # -------------------------------------------------------------------------
+    - name: Build full ACL permission string
+      ansible.builtin.set_fact:
+        redis_acl_full_permissions: "on >{{ redis_acl_password }} {{ redis_acl_permissions }}"
+      no_log: true
+      when: operation == 'create_user'
+      tags: [create_user]
+
+    - name: Create Redis ACL user
+      ansible.builtin.command:
+        cmd: >
+          {{ redis_cli_path }} -p {{ redis_port }} {{ redis_auth_arg }}
+          ACL SETUSER {{ redis_acl_user }} {{ redis_acl_full_permissions }}
+      register: redis_acl_create
+      changed_when: "'OK' in redis_acl_create.stdout"
+      no_log: true
+      when: operation == 'create_user'
+      tags: [create_user]
+
+    - name: Persist ACL rules to aclfile (ACL SAVE)
+      ansible.builtin.command:
+        cmd: "{{ redis_cli_path }} -p {{ redis_port }} {{ redis_auth_arg }} ACL SAVE"
+      register: redis_acl_save
+      changed_when: "'OK' in redis_acl_save.stdout"
+      no_log: true
+      when: operation == 'create_user'
+      tags: [create_user]
+
+    - name: Show ACL creation result
+      ansible.builtin.debug:
+        msg: "ACL user '{{ redis_acl_user }}' created/updated and persisted successfully."
+      when: operation == 'create_user'
+      tags: [create_user]
